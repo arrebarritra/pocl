@@ -150,7 +150,8 @@ typedef struct pocl_cuda_event_data_s
   CUevent end;
   volatile int events_ready;
   cl_int *ext_event_flag;
-  pthread_cond_t event_cond;
+  pthread_mutex_t lock; /* Only used when use_threads == false */
+  pthread_cond_t event_cond; /* Only used when use_threads == true */
   volatile unsigned num_ext_events;
 } pocl_cuda_event_data_t;
 
@@ -627,11 +628,11 @@ pocl_cuda_init (unsigned j, cl_device_id dev, const char *parameters)
     {
       result = cuDriverGetVersion(&driver_version);
       if (CUDA_CHECK_ERROR (result, "cuDriverGetVersion"))
-	{
+    {
           ret = CL_INVALID_DEVICE;
-	}
+    }
       else
-	{
+    {
 #if CUDA_VERSION >= 11010
           if (driver_version >= 11010)
             {
@@ -2398,11 +2399,11 @@ pocl_cuda_submit_node (_cl_command_node *node, cl_command_queue cq, int locked)
         {
           for (unsigned int i = 0; i < cmd->svm_free.num_svm_pointers; i++)
             {
-	      void *ptr = cmd->svm_free.svm_pointers[i];
-	      /* This updates bookkeeping associated with the 'ptr'
-		 done by the PoCL core. */
-	      POname (clSVMFree) (event->context, ptr);
-	    }
+          void *ptr = cmd->svm_free.svm_pointers[i];
+          /* This updates bookkeeping associated with the 'ptr'
+         done by the PoCL core. */
+          POname (clSVMFree) (event->context, ptr);
+        }
         }
       break;
     case CL_COMMAND_READ_IMAGE:
@@ -2454,6 +2455,7 @@ pocl_cuda_submit (_cl_command_node *node, cl_command_queue cq)
     {
       /* Submit command in this thread */
       cuCtxSetCurrent (((pocl_cuda_device_data_t *)cq->device->data)->context);
+      PTHREAD_CHECK (pthread_mutex_init (&p->lock, NULL));
       pocl_cuda_submit_node (node, cq, 1);
     }
 }
@@ -2587,11 +2589,21 @@ pocl_cuda_update_event (cl_device_id device, cl_event event)
 void
 pocl_cuda_wait_event_recurse (cl_device_id device, cl_event event)
 {
+  pocl_cuda_event_data_t *e_d = (pocl_cuda_event_data_t *)event->data;
+  if (pthread_mutex_trylock (&e_d->lock) != 0) {
+    /* This event is being handled by another thread */
+    return;
+  }
+
+  /* This lock is held until the event is freed */
   while (event->wait_list)
     pocl_cuda_wait_event_recurse (device, event->wait_list->event);
 
-  if (event->status > CL_COMPLETE)
-    pocl_cuda_finalize_command (device, event);
+  /* Wait until event has been submitted */
+  while (!e_d->events_ready)
+      ;
+  assert (event->status == CL_SUBMITTED); 
+  pocl_cuda_finalize_command (device, event);
 }
 
 void
@@ -2633,7 +2645,15 @@ pocl_cuda_free_event_data (cl_event event)
     {
       pocl_cuda_event_data_t *event_data
           = (pocl_cuda_event_data_t *)event->data;
-      PTHREAD_CHECK (pthread_cond_destroy (&event_data->event_cond));
+      
+      pocl_cuda_event_data_t *e_d = (pocl_cuda_event_data_t *)event->data;
+
+      if (((pocl_cuda_queue_data_t *)event->queue->data)->use_threads)
+        PTHREAD_CHECK (pthread_cond_destroy (&event_data->event_cond));
+      else {
+        PTHREAD_CHECK (pthread_mutex_unlock (&event_data->lock));
+        PTHREAD_CHECK (pthread_mutex_destroy (&event_data->lock));
+      }
       if (event->queue->properties & CL_QUEUE_PROFILING_ENABLE)
         cuEventDestroy (event_data->start);
       cuEventDestroy (event_data->end);
